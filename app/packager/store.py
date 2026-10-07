@@ -4,8 +4,10 @@ Core fields and the raw extension subtree are stored separately per
 revision: ``core_json`` holds the canonical serialization of the editable
 core fields, ``ext_raw`` holds the extension members exactly as received
 (a JSON array of [key, raw_value_text] pairs, the raw text itself never
-re-serialized).  Processed requests are recorded so that a replayed request
-id returns the original revision and summary even after a restart.
+re-serialized).  Processed requests are recorded — including adjudicated
+rejections — so that a replayed request id returns the original ruling
+even after a restart, and a different payload under the same id is
+refused once any ruling has been made.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS requests (
     request_id TEXT PRIMARY KEY,
     package_id TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 200,
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -79,6 +82,20 @@ class Store:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring databases created by older versions up to the current schema."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if "status_code" not in cols:
+            # Every request recorded before this column existed was a 200.
+            self._conn.execute(
+                "ALTER TABLE requests ADD COLUMN status_code"
+                " INTEGER NOT NULL DEFAULT 200"
+            )
 
     # -- packages / revisions ---------------------------------------------
 
@@ -211,16 +228,22 @@ class Store:
         return dict(row) if row else None
 
     def record_request(
-        self, request_id: str, package_id: str, request_hash: str, response: Dict[str, Any]
+        self,
+        request_id: str,
+        package_id: str,
+        request_hash: str,
+        response: Dict[str, Any],
+        status_code: int = 200,
     ) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO requests (request_id, package_id, request_hash,"
-                " response_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                " status_code, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     request_id,
                     package_id,
                     request_hash,
+                    status_code,
                     json.dumps(response, ensure_ascii=False),
                     _now(),
                 ),

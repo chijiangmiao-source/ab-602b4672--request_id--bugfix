@@ -190,11 +190,65 @@ def t_delete_unknown_rejected():
     status, body, _ = req("POST", f"/api/packages/{pid}/revisions",
                           update_body(rid('up-g'), 4, ["name"], {"x_tag.v": 2}))
     assert status == 409 and body["reason"] == "unknown_field", (status, body)
+    # a field-boundary rejection consumes its request id too: the same id
+    # carrying a different, otherwise applicable payload must not apply
+    status, body, _ = req("POST", f"/api/packages/{pid}/revisions",
+                          update_body(rid('up-e'), 4, ["name"], {"name": "HIJACK-E"}))
+    assert status == 409 and body["reason"] == "request_id_reuse", (status, body)
+    status, body, _ = req("POST", f"/api/packages/{pid}/revisions",
+                          update_body(rid('up-f'), 4, ["name"], {"name": "HIJACK-F"}))
+    assert status == 409 and body["reason"] == "request_id_reuse", (status, body)
     # nothing was rewritten
     meta = req("GET", "/api/packages/" + pid + "/meta")[1]
     assert meta["current_revision"] == 4, meta
     doc = json.loads(req("GET", "/api/packages/" + pid, raw=True)[1])
     assert doc["x_tag"] == {"v": 1} and doc["notes"] == "keep", doc
+    assert doc["name"] == "SMOKE-2B", doc
+
+
+@check("rejected request_id cannot be reused with a different payload")
+def t_rejection_consumes_request_id():
+    body = (
+        '{"request_id": "' + rid('create-3') + '",'
+        ' "terminal": {"id": "reviewer", "known_fields": ' + json.dumps(ALL_CORE) + '},'
+        ' "document": {"name": "SMOKE-3", "priority": "high"}}'
+    )
+    status, created, _ = req("POST", "/api/packages", body)
+    assert status == 200 and created["revision"] == 1, created
+    pid = created["package_id"]
+
+    # rev 2: another request id advances priority
+    status, a, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(rid('up-3a'), 1, ["priority"], {"priority": "routine"}))
+    assert status == 200 and a["decision"] == "applied" and a["revision"] == 2, a
+
+    # stale-base conflict: the request is rejected and its id is burned
+    burned = rid('reused-after-rejection')
+    conflict = update_body(burned, 1, ["priority"], {"priority": "low"})
+    status, c, _ = req("POST", f"/api/packages/{pid}/revisions", conflict)
+    assert status == 409 and c["reason"] == "conflicting_paths", (status, c)
+    assert c["detail"] == ["priority"], c
+
+    # same id, different and otherwise applicable payload -> request_id_reuse
+    status, d, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(burned, 2, ["name"], {"name": "SMOKE-3B"}))
+    assert status == 409 and d["reason"] == "request_id_reuse", (status, d)
+
+    # identical replay of the rejected request replays the same 409 ruling
+    status, e, _ = req("POST", f"/api/packages/{pid}/revisions", conflict)
+    assert status == 409 and e["reason"] == "conflicting_paths", (status, e)
+
+    # the reuse attempt changed nothing: revision and document are intact
+    meta = req("GET", "/api/packages/" + pid + "/meta")[1]
+    assert meta["current_revision"] == 2, meta
+    doc = json.loads(req("GET", "/api/packages/" + pid, raw=True)[1])
+    assert doc["name"] == "SMOKE-3" and doc["priority"] == "routine", doc
+
+    # the rulings are visible in the adjudication log
+    adj = req("GET", f"/api/packages/{pid}/adjudications")[1]["adjudications"]
+    reasons = [(a["decision"], a["reason"]) for a in adj]
+    assert ("rejected", "conflicting_paths") in reasons, reasons
+    assert ("rejected", "request_id_reuse") in reasons, reasons
 
 
 @check("adjudication log records every ruling")

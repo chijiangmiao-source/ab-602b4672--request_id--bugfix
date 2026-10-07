@@ -36,31 +36,35 @@ def _request_hash(body: bytes) -> str:
     return hashlib.sha256(canonical(json.loads(body.decode("utf-8"))).encode("utf-8")).hexdigest()
 
 
-def _request_id_safe(body: bytes) -> str:
+def _request_id_safe(body: bytes) -> Optional[str]:
     try:
         rid = json.loads(body.decode("utf-8")).get("request_id")
-        return rid if isinstance(rid, str) else "<unknown>"
+        return rid if isinstance(rid, str) and rid.strip() else None
     except Exception:
-        return "<unknown>"
+        return None
 
 
 def _check_idempotency(request_id: str, body: bytes) -> Optional[Response]:
-    """Return a response if this request_id was already processed, else None.
+    """Return a response if this request_id was already adjudicated, else None.
 
-    Same payload -> replay the stored revision and summary.  Different
-    payload under the same request id -> 409, nothing is rewritten.
+    Same payload -> replay the stored ruling with its original status.
+    Different payload under the same request id -> 409, nothing is
+    rewritten.  Any ruling consumes the id, including rejections: a
+    rejection is final and never frees the id for a different payload.
     """
     record = store.find_request(request_id)
     if record is None:
         return None
     if record["request_hash"] == _request_hash(body):
         response = json.loads(record["response_json"])
-        response["decision"] = "replayed"
+        status_code = record["status_code"]
+        if status_code == 200:
+            response["decision"] = "replayed"
         store.record_adjudication(
             record["package_id"], request_id, None, "replayed",
             "identical payload replayed", response.get("revision"),
         )
-        return _error(200, response)
+        return _error(status_code, response)
     store.record_adjudication(
         record["package_id"], request_id, None, "rejected",
         "request_id_reuse", None,
@@ -200,6 +204,14 @@ def get_adjudications(package_id: str) -> Response:
 @app.post("/api/packages/{package_id}/revisions")
 async def submit_revision(package_id: str, request: Request) -> Response:
     body = await request.body()
+    # A request id is bound to the first ruling made under it — including
+    # rejections — so the idempotency check runs before any adjudication.
+    request_id = _request_id_safe(body)
+    if request_id is not None:
+        replay = _check_idempotency(request_id, body)
+        if replay is not None:
+            return replay
+
     pkg = store.get_package(package_id)
     try:
         env = parse_update(body)
@@ -207,19 +219,21 @@ async def submit_revision(package_id: str, request: Request) -> Response:
         return _error(422, {"detail": str(exc)})
     except RejectError as exc:
         # Patch touches a field the terminal must not touch (unknown to the
-        # service, or not declared by the terminal).  Record the ruling.
-        if pkg is not None:
+        # service, or not declared by the terminal).  Record the ruling and
+        # consume the request id: a rejection is final.
+        if pkg is not None and request_id is not None:
+            store.record_request(
+                request_id, package_id, _request_hash(body),
+                {"decision": "rejected", "reason": exc.reason, "detail": exc.detail},
+                status_code=409,
+            )
             store.record_adjudication(
-                package_id, _request_id_safe(body), None, "rejected", exc.reason, None
+                package_id, request_id, None, "rejected", exc.reason, None
             )
         return _error(409, {"decision": "rejected", "reason": exc.reason, "detail": exc.detail})
 
     if pkg is None:
         return _error(404, {"detail": "package not found"})
-
-    replay = _check_idempotency(env.request_id, body)
-    if replay is not None:
-        return replay
 
     current_rev: int = pkg["current_revision"]
     if env.base_revision > current_rev:
@@ -241,16 +255,21 @@ async def submit_revision(package_id: str, request: Request) -> Response:
             base_is_current=(env.base_revision == current_rev),
         )
     except RejectError as exc:
-        store.record_adjudication(
-            package_id, env.request_id, env.base_revision, "rejected", exc.reason, None
-        )
-        return _error(409, {
+        # Merge conflict: record the ruling and consume the request id.
+        response = {
             "decision": "rejected",
             "reason": exc.reason,
             "detail": exc.detail,
             "package_id": package_id,
             "current_revision": current_rev,
-        })
+        }
+        store.record_request(
+            env.request_id, package_id, _request_hash(body), response, status_code=409
+        )
+        store.record_adjudication(
+            package_id, env.request_id, env.base_revision, "rejected", exc.reason, None
+        )
+        return _error(409, response)
     except ValueError as exc:
         return _error(422, {"detail": str(exc)})
 
