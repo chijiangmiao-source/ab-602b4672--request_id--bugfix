@@ -175,6 +175,80 @@ def t_merge_and_conflict():
     STATE["pid2"] = pid
 
 
+@check("a rejected request id cannot be reused with another payload")
+def t_rejected_request_id_is_bound():
+    body = (
+        '{"request_id": "' + rid('r-create') + '",'
+        ' "terminal": {"id": "reviewer", "known_fields": ' + json.dumps(ALL_CORE) + '},'
+        ' "document": {"name": "A", "priority": "high"}}'
+    )
+    status, created, _ = req("POST", "/api/packages", body)
+    assert status == 200 and created["revision"] == 1, created
+    pid = created["package_id"]
+
+    # rev 2: advance priority to routine, based on rev 1, fresh request id
+    status, r2, _ = req("POST", f"/api/packages/{pid}/revisions",
+                        update_body(rid('r-up-2'), 1, ["priority"], {"priority": "routine"}))
+    assert status == 200 and r2["decision"] == "applied" and r2["revision"] == 2, r2
+
+    # stale low-priority update still based on rev 1 conflicts and is rejected
+    conflict_id = rid('reused-after-rejection')
+    conflict_body = update_body(conflict_id, 1, ["priority"], {"priority": "low"})
+    status, c, _ = req("POST", f"/api/packages/{pid}/revisions", conflict_body)
+    assert status == 409 and c["reason"] == "conflicting_paths", (status, c)
+    assert c["detail"] == ["priority"], c
+
+    # same id, different content that would otherwise apply (based on rev 2):
+    # the rejection must keep the id bound -> 409 request_id_reuse, rev frozen
+    reuse_body = update_body(conflict_id, 2, ["name"], {"name": "B"})
+    status, r, _ = req("POST", f"/api/packages/{pid}/revisions", reuse_body)
+    assert status == 409 and r["reason"] == "request_id_reuse", (status, r)
+    meta = req("GET", f"/api/packages/{pid}/meta")[1]
+    assert meta["current_revision"] == 2, meta
+    doc = json.loads(req("GET", f"/api/packages/{pid}", raw=True)[1])
+    assert doc == {"name": "A", "priority": "routine"}, doc
+
+    # resending the original rejected payload replays the same refusal ...
+    status, again, _ = req("POST", f"/api/packages/{pid}/revisions", conflict_body)
+    assert status == 409 and again["reason"] == "conflicting_paths", (status, again)
+    # ... and a third reuse attempt with yet another payload is still refused
+    status, r3, _ = req(
+        "POST", f"/api/packages/{pid}/revisions",
+        update_body(conflict_id, 2, ["name"], {"name": "C"}),
+    )
+    assert status == 409 and r3["reason"] == "request_id_reuse", (status, r3)
+    meta = req("GET", f"/api/packages/{pid}/meta")[1]
+    assert meta["current_revision"] == 2, meta
+    STATE["pid3"] = pid
+
+
+@check("field-boundary rejections bind the request id as well")
+def t_field_boundary_rejection_binds_id():
+    pid = STATE["pid3"]
+    bound_id = rid('bound-after-undeclared')
+    # touching an extension field is refused ...
+    status, b1, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(bound_id, 2, ["name"], {"x_tag.v": 1}))
+    assert status == 409 and b1["reason"] == "unknown_field", (status, b1)
+    # ... and the same id cannot afterwards carry an applicable update
+    status, b2, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(bound_id, 2, ["name"], {"name": "C"}))
+    assert status == 409 and b2["reason"] == "request_id_reuse", (status, b2)
+
+    bound_id2 = rid('bound-after-undeclared-2')
+    status, b3, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(bound_id2, 2, ["name"], delete=["notes"]))
+    assert status == 409 and b3["reason"] == "undeclared_field", (status, b3)
+    status, b4, _ = req("POST", f"/api/packages/{pid}/revisions",
+                       update_body(bound_id2, 2, ["name"], {"name": "D"}))
+    assert status == 409 and b4["reason"] == "request_id_reuse", (status, b4)
+
+    meta = req("GET", f"/api/packages/{pid}/meta")[1]
+    assert meta["current_revision"] == 2, meta
+    doc = json.loads(req("GET", f"/api/packages/{pid}", raw=True)[1])
+    assert doc == {"name": "A", "priority": "routine"}, doc
+
+
 @check("deleting unknown or undeclared fields is rejected")
 def t_delete_unknown_rejected():
     pid = STATE["pid2"]

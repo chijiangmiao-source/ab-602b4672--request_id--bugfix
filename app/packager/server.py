@@ -44,23 +44,49 @@ def _request_id_safe(body: bytes) -> str:
         return "<unknown>"
 
 
-def _check_idempotency(request_id: str, body: bytes) -> Optional[Response]:
-    """Return a response if this request_id was already processed, else None.
+def _bound_request(body: bytes) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Look up a request id already bound to a business verdict.
 
-    Same payload -> replay the stored revision and summary.  Different
-    payload under the same request id -> 409, nothing is rewritten.
+    Returns ``(record, request_id)``; record is None for an unbound id or
+    when no request id can be extracted from the body.
     """
-    record = store.find_request(request_id)
-    if record is None:
-        return None
-    if record["request_hash"] == _request_hash(body):
-        response = json.loads(record["response_json"])
-        response["decision"] = "replayed"
+    request_id = _request_id_safe(body)
+    if request_id == "<unknown>":
+        return None, request_id
+    return store.find_request(request_id), request_id
+
+
+def _serve_bound_request(record: Dict[str, Any], body: bytes) -> Response:
+    """Replay an already-adjudicated request id, or refuse its reuse.
+
+    Same payload -> replay the stored verdict (200 for applied requests,
+    the original 409 for rejected ones).  Different payload -> 409
+    ``request_id_reuse`` regardless of whether the original verdict was
+    applied or rejected: a rejection binds the id just as firmly and may
+    never become reusable for another update.  Nothing is rewritten.
+    """
+    request_id = record["request_id"]
+    try:
+        same_payload = record["request_hash"] == _request_hash(body)
+    except Exception:
+        # An unparseable body cannot be identical to a stored valid payload.
+        same_payload = False
+
+    if same_payload:
+        stored = json.loads(record["response_json"])
+        if record.get("outcome") == "rejected":
+            store.record_adjudication(
+                record["package_id"], request_id, None, "rejected",
+                "identical payload replayed", None,
+            )
+            return _error(409, stored)
+        stored["decision"] = "replayed"
         store.record_adjudication(
             record["package_id"], request_id, None, "replayed",
-            "identical payload replayed", response.get("revision"),
+            "identical payload replayed", stored.get("revision"),
         )
-        return _error(200, response)
+        return _error(200, stored)
+
     store.record_adjudication(
         record["package_id"], request_id, None, "rejected",
         "request_id_reuse", None,
@@ -71,6 +97,31 @@ def _check_idempotency(request_id: str, body: bytes) -> Optional[Response]:
         "detail": "request_id was already used with a different payload",
         "package_id": record["package_id"],
     })
+
+
+def _reject(
+    body: bytes,
+    request_id: str,
+    package_id: Optional[str],
+    base_revision: Optional[int],
+    reason: str,
+    payload: Dict[str, Any],
+) -> Response:
+    """Return a 409 and bind the request id so it cannot be reused.
+
+    The rejection payload is itself recorded under the request id: a later
+    identical submission replays this same refusal, and a different payload
+    is rejected as ``request_id_reuse`` without touching any revision.
+    """
+    if package_id is not None and request_id != "<unknown>":
+        store.record_rejected_request(
+            request_id, package_id, _request_hash(body), payload
+        )
+    if package_id is not None:
+        store.record_adjudication(
+            package_id, request_id, base_revision, "rejected", reason, None
+        )
+    return _error(409, payload)
 
 
 def _splice_document(core: Dict[str, Any], ext_pairs: List[Tuple[str, bytes, bytes]]) -> bytes:
@@ -142,9 +193,9 @@ async def create_package(request: Request) -> Response:
     except EnvelopeError as exc:
         return _error(422, {"detail": str(exc)})
 
-    replay = _check_idempotency(env.request_id, body)
-    if replay is not None:
-        return replay
+    record = store.find_request(env.request_id)
+    if record is not None:
+        return _serve_bound_request(record, body)
 
     package_id = uuid.uuid4().hex[:12]
     summary = summary_of(env.core, env.ext_pairs)
@@ -207,19 +258,32 @@ async def submit_revision(package_id: str, request: Request) -> Response:
         return _error(422, {"detail": str(exc)})
     except RejectError as exc:
         # Patch touches a field the terminal must not touch (unknown to the
-        # service, or not declared by the terminal).  Record the ruling.
+        # service, or not declared by the terminal).  An id already bound to
+        # a verdict governs: replay the prior refusal or reject its reuse.
         if pkg is not None:
-            store.record_adjudication(
-                package_id, _request_id_safe(body), None, "rejected", exc.reason, None
-            )
-        return _error(409, {"decision": "rejected", "reason": exc.reason, "detail": exc.detail})
+            bound, _request_id = _bound_request(body)
+            if bound is not None:
+                return _serve_bound_request(bound, body)
+        payload: Dict[str, Any] = {
+            "decision": "rejected", "reason": exc.reason, "detail": exc.detail
+        }
+        if pkg is not None:
+            payload["package_id"] = package_id
+        return _reject(
+            body, _request_id_safe(body),
+            package_id if pkg is not None else None,
+            None, exc.reason, payload,
+        )
 
     if pkg is None:
         return _error(404, {"detail": "package not found"})
 
-    replay = _check_idempotency(env.request_id, body)
-    if replay is not None:
-        return replay
+    # The id is already bound to a verdict: identical payload replays it,
+    # a different payload is request_id_reuse -- including an id whose prior
+    # verdict was a rejection, which must never become reusable again.
+    record = store.find_request(env.request_id)
+    if record is not None:
+        return _serve_bound_request(record, body)
 
     current_rev: int = pkg["current_revision"]
     if env.base_revision > current_rev:
@@ -241,16 +305,16 @@ async def submit_revision(package_id: str, request: Request) -> Response:
             base_is_current=(env.base_revision == current_rev),
         )
     except RejectError as exc:
-        store.record_adjudication(
-            package_id, env.request_id, env.base_revision, "rejected", exc.reason, None
-        )
-        return _error(409, {
+        payload = {
             "decision": "rejected",
             "reason": exc.reason,
             "detail": exc.detail,
             "package_id": package_id,
             "current_revision": current_rev,
-        })
+        }
+        return _reject(
+            body, env.request_id, package_id, env.base_revision, exc.reason, payload
+        )
     except ValueError as exc:
         return _error(422, {"detail": str(exc)})
 

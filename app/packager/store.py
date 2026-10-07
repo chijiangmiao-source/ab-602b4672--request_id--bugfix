@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS requests (
     package_id TEXT NOT NULL,
     request_hash TEXT NOT NULL,
     response_json TEXT NOT NULL,
+    -- "applied": the verdict created/advanced/replayed a revision (created,
+    -- applied, merged, noop); "rejected": the verdict was a 409 refusal.  A
+    -- rejected request id stays bound to its payload and may never represent
+    -- a different update afterwards.
+    outcome TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS adjudications (
@@ -79,6 +84,21 @@ class Store:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring older databases up to the current schema."""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(requests)")
+        }
+        if "outcome" not in cols:
+            # Every request recorded by older builds carried an applied (or
+            # replayed) verdict; rejected request ids were never stored.
+            self._conn.execute(
+                "ALTER TABLE requests ADD COLUMN outcome TEXT NOT NULL"
+                " DEFAULT 'applied'"
+            )
 
     # -- packages / revisions ---------------------------------------------
 
@@ -216,7 +236,33 @@ class Store:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO requests (request_id, package_id, request_hash,"
-                " response_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                " response_json, outcome, created_at) VALUES (?, ?, ?, ?, 'applied', ?)",
+                (
+                    request_id,
+                    package_id,
+                    request_hash,
+                    json.dumps(response, ensure_ascii=False),
+                    _now(),
+                ),
+            )
+
+    def record_rejected_request(
+        self,
+        request_id: str,
+        package_id: str,
+        request_hash: str,
+        response: Dict[str, Any],
+    ) -> None:
+        """Bind a rejected request id to its payload.
+
+        A rejection is a final business verdict: the id is recorded so that
+        later reuse with the same payload replays the refusal and reuse with a
+        different payload fails with ``request_id_reuse``.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO requests (request_id, package_id, request_hash,"
+                " response_json, outcome, created_at) VALUES (?, ?, ?, ?, 'rejected', ?)",
                 (
                     request_id,
                     package_id,
