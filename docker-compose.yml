@@ -1,0 +1,32 @@
+services:
+  app:
+    build: ./app
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - app-data:/data
+    ports:
+      - "${APP_HOST_PORT:-8080}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:8000
+
+volumes:
+  app-data:
